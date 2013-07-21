@@ -95,7 +95,7 @@ struct JS_DATA_SAVE_TYPE glue;
 
 static struct unijoy_attr unijoy_ctl_merger = {
 	.attr.name = "merger",
-	.attr.mode = 0644
+	.attr.mode = 0666
 };
 
 static struct attribute * unijoy_ctl_attrs[] = {
@@ -124,6 +124,9 @@ static ssize_t unijoy_ctl_merger_show(struct kobject *kobj,
 												unijoy_source_state_names[source->state], 
 												source->axes, source->buttons, source->name);
 	}
+
+	offset += scnprintf(buf+offset, PAGE_SIZE-offset,
+			"Operating as /dev/input/js%d\n", MINOR(devt));
 	return offset;
 }
 
