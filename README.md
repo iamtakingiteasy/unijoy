@@ -10,15 +10,15 @@ Building
 Simply, `make`
 
 
-        user@noteshi ~/soft/mine/unijoy $ make
-        make -C /lib/modules/3.9.2-tuxonice/build M=/home/user/soft/mine/unijoy modules
-        make[1]: Entering directory `/usr/src/linux-3.9.2-tuxonice'
-          CC [M]  /home/user/soft/mine/unijoy/unijoy.o
-          Building modules, stage 2.
-          MODPOST 1 modules
-          CC      /home/user/soft/mine/unijoy/unijoy.mod.o
-          LD [M]  /home/user/soft/mine/unijoy/unijoy.ko
-        make[1]: Leaving directory `/usr/src/linux-3.9.2-tuxonice'
+    user@noteshi ~/soft/mine/unijoy $ make
+    make -C /lib/modules/3.9.2-tuxonice/build M=/home/user/soft/mine/unijoy modules
+    make[1]: Entering directory `/usr/src/linux-3.9.2-tuxonice'
+      CC [M]  /home/user/soft/mine/unijoy/unijoy.o
+      Building modules, stage 2.
+      MODPOST 1 modules
+      CC      /home/user/soft/mine/unijoy/unijoy.mod.o
+      LD [M]  /home/user/soft/mine/unijoy/unijoy.ko
+    make[1]: Leaving directory `/usr/src/linux-3.9.2-tuxonice'
 
 Using
 =====
@@ -35,11 +35,11 @@ Control file is located in `/sys/unijoy_ctl/merger` path.
 
 Try reading it's contents:
 
-        user@noteshi ~/soft/mine/unijoy $ cat /sys/unijoy_ctl/merger 
-        849162346430737	ONLINE	7	32	Thrustmaster Throttle - HOTAS Warthog
-        849162346299665	ONLINE	4	19	Thustmaster Joystick - HOTAS Warthog
-        855256926716177	ONLINE	37	57	A4TECH USB Device
-				Operating as /dev/input/js3
+    user@noteshi ~/soft/mine/unijoy $ cat /sys/unijoy_ctl/merger 
+    849162346430737	ONLINE	7	32	Thrustmaster Throttle - HOTAS Warthog
+    849162346299665	ONLINE	4	19	Thustmaster Joystick - HOTAS Warthog
+    855256926716177	ONLINE	37	57	A4TECH USB Device
+    Operating as /dev/input/js3
 
 The first column is ID of device. You will use it every time
 you wish to refer to a specific device. It is pretty unique.
@@ -66,16 +66,16 @@ Adding devices to a merge
 
 Syntax: `merge <ID>`:
 
-        user@noteshi ~/soft/mine/unijoy $ echo merge 849162346299665 > /sys/unijoy_ctl/merger
-		    user@noteshi ~/soft/mine/unijoy $ echo merge 849162346430737 > /sys/unijoy_ctl/merger
+    user@noteshi ~/soft/mine/unijoy $ echo merge 849162346299665 > /sys/unijoy_ctl/merger
+    user@noteshi ~/soft/mine/unijoy $ echo merge 849162346430737 > /sys/unijoy_ctl/merger
 
 Now lets look at device file once again:
 
-        user@noteshi ~/soft/mine/unijoy $ cat /sys/unijoy_ctl/merger
-				849162346430737	MERGED	7	32	Thrustmaster Throttle - HOTAS Warthog
-        849162346299665	MERGED	4	19	Thustmaster Joystick - HOTAS Warthog
-        855256926716177	ONLINE	37	57	A4TECH USB Device
-				Operating as /dev/input/js3
+    user@noteshi ~/soft/mine/unijoy $ cat /sys/unijoy_ctl/merger
+    849162346430737	MERGED	7	32	Thrustmaster Throttle - HOTAS Warthog
+    849162346299665	MERGED	4	19	Thustmaster Joystick - HOTAS Warthog
+    855256926716177	ONLINE	37	57	A4TECH USB Device
+    Operating as /dev/input/js3
 
 Adding buttons to the merge device
 ----------------------------------
@@ -84,12 +84,12 @@ Syntax: `add_button <ID> <source button #> [dest button #]`
 
 (dest button # is optional, last unused would be picked if missing)
 
-        user@noteshi ~/soft/mine/unijoy $ echo add_button 849162346299665 0 0 > /sys/unijoy_ctl/merger
-        user@noteshi ~/soft/mine/unijoy $ echo add_button 849162346299665 1 1 > /sys/unijoy_ctl/merger
-        user@noteshi ~/soft/mine/unijoy $ echo add_button 849162346299665 2 5 > /sys/unijoy_ctl/merger
-        user@noteshi ~/soft/mine/unijoy $ echo add_button 849162346430737 0 2 > /sys/unijoy_ctl/merger
-				user@noteshi ~/soft/mine/unijoy $ echo add_button 849162346430737 1 3 > /sys/unijoy_ctl/merger
-				user@noteshi ~/soft/mine/unijoy $ echo add_button 849162346430737 2 4 > /sys/unijoy_ctl/merger
+    user@noteshi ~/soft/mine/unijoy $ echo add_button 849162346299665 0 0 > /sys/unijoy_ctl/merger
+    user@noteshi ~/soft/mine/unijoy $ echo add_button 849162346299665 1 1 > /sys/unijoy_ctl/merger
+    user@noteshi ~/soft/mine/unijoy $ echo add_button 849162346299665 2 5 > /sys/unijoy_ctl/merger
+    user@noteshi ~/soft/mine/unijoy $ echo add_button 849162346430737 0 2 > /sys/unijoy_ctl/merger
+    user@noteshi ~/soft/mine/unijoy $ echo add_button 849162346430737 1 3 > /sys/unijoy_ctl/merger
+    user@noteshi ~/soft/mine/unijoy $ echo add_button 849162346430737 2 4 > /sys/unijoy_ctl/merger
 
 
 Removing buttons from the merge device
@@ -97,7 +97,7 @@ Removing buttons from the merge device
 
 Syntax: `del_button <dest button #>`
 
-        user@noteshi ~/soft/mine/unijoy $ echo del_button 2 > /sys/unijoy_ctl/merger
+    user@noteshi ~/soft/mine/unijoy $ echo del_button 2 > /sys/unijoy_ctl/merger
 
 
 Adding axes to the merge device
@@ -107,21 +107,21 @@ Syntax: `add_axis <ID> <source axis #> [dest axis #]`
 
 (dest axis # is optional, last unused would be picked if missing)
 
-				user@noteshi ~/soft/mine/unijoy $ echo add_axis 849162346430737 0 0 > /sys/unijoy_ctl/merger
-				user@noteshi ~/soft/mine/unijoy $ echo add_axis 849162346430737 1 1 > /sys/unijoy_ctl/merger
-				user@noteshi ~/soft/mine/unijoy $ echo add_axis 849162346299665 0 2 > /sys/unijoy_ctl/merger
-				user@noteshi ~/soft/mine/unijoy $ echo add_axis 849162346299665 1 3 > /sys/unijoy_ctl/merger
+    user@noteshi ~/soft/mine/unijoy $ echo add_axis 849162346430737 0 0 > /sys/unijoy_ctl/merger
+    user@noteshi ~/soft/mine/unijoy $ echo add_axis 849162346430737 1 1 > /sys/unijoy_ctl/merger
+    user@noteshi ~/soft/mine/unijoy $ echo add_axis 849162346299665 0 2 > /sys/unijoy_ctl/merger
+    user@noteshi ~/soft/mine/unijoy $ echo add_axis 849162346299665 1 3 > /sys/unijoy_ctl/merger
 
 Removing axes from the merge device
 -----------------------------------
 
 Syntax: `del_axis <dest axis #>`
 
-        user@noteshi ~/soft/mine/unijoy $ echo del_axis 2 > /sys/unijoy_ctl/merger
+    user@noteshi ~/soft/mine/unijoy $ echo del_axis 2 > /sys/unijoy_ctl/merger
 
 Testing setup
 -------------
 
 I recommend jstest utility from linuxconsoletools package (sometimes provided under `joystick` package).
 
-        user@noteshi ~/soft/mine/unijoy $ jstest /dev/input/js3
+    user@noteshi ~/soft/mine/unijoy $ jstest /dev/input/js3
