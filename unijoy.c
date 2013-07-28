@@ -738,8 +738,6 @@ static int unijoy_thread(void *nulldata) {
       
       data = (__u64)-1;
 
-      printk("tail: %d -> head: %d\n",output.tail, output.head);
-      
       spin_lock_irq(&output.buffer_lock);
       data = output.buffer[output.tail++];
       output.tail &= UNIJOY_BUFFER_SIZE - 1;
