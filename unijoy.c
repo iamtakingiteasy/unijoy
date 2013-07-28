@@ -1,16 +1,3 @@
-#include <linux/kernel.h>
-#include <linux/kthread.h>
-#include <linux/module.h>
-#include <linux/input.h>
-#include <linux/joystick.h>
-#include <linux/list.h>
-#include <linux/slab.h>
-
-MODULE_LICENSE("Dual BSD/GPL");
-MODULE_AUTHOR("Alexander <iamtaingiteasy> Tumin");
-MODULE_DESCRIPTION("Makes a union of N other input/js devices");
-MODULE_SUPPORTED_DEVICE("input/jsN");
-
 /**
  * This module is providing virtual joystick device interface composed
  * of N real devices.
@@ -46,6 +33,15 @@ MODULE_SUPPORTED_DEVICE("input/jsN");
  *     likewise del_button, only for axis
  */
 
+#include <linux/kernel.h>
+#include <linux/kthread.h>
+#include <linux/module.h>
+#include <linux/input.h>
+#include <linux/joystick.h>
+#include <linux/list.h>
+#include <linux/slab.h>
+#include <linux/ctype.h>
+
 #define UNIJOY_MINOR_BASE 0
 #define UNIJOY_MINORS 16
 #define UNIJOY_BUFFER_SIZE 128
@@ -54,6 +50,7 @@ MODULE_SUPPORTED_DEVICE("input/jsN");
 /* Threads */
 
 static int unijoy_thread(void *);
+static __u64 unijoy_thread_nextdata(void);
 static int unijoy_thread_wakeup_condition(void);
 
 enum unijoy_thread_action {
@@ -67,13 +64,13 @@ enum unijoy_thread_action {
 enum unijoy_inph_state {
   UNIJOY_SOURCE_ONLINE,
   UNIJOY_SOURCE_MERGED,
-  UNIJOY_SOURCE_WASMERGED
+  UNIJOY_SOURCE_DISCONNECTED
 };
 
 static char *unijoy_inph_state_names[] = {
-  "   ONLINE",
-  "   MERGED",
-  "WASMERGED"
+  "      ONLINE",
+  "      MERGED",
+  "DISCONNECTED"
 };
 
 static char *unijoy_inph_mapping_names[] = {
@@ -317,13 +314,13 @@ static ssize_t unijoy_sysfs_show(struct kobject *kobj, struct attribute *attr,
 static ssize_t unijoy_sysfs_store(struct kobject *kobj, struct attribute *attr,
                                   const char *in_buf, size_t in_len) {
   struct unijoy_inph_source *source;
+  int error = 0;
   char *buf = kzalloc(in_len+1, GFP_KERNEL);
   char *ptr = buf;
+  char *rptr;
   int op = 0;
   int len = in_len;
-  char *opword;
-  int opwordlen;
-  __u64 id = (__u64)-1;
+  __u64 id = ULLONG_MAX;
   int arg1 = -1, arg2 = -1;
 
   if (!buf) 
@@ -331,27 +328,41 @@ static ssize_t unijoy_sysfs_store(struct kobject *kobj, struct attribute *attr,
   
   memmove(buf, in_buf, in_len);
 
-  while(*ptr && *ptr == ' ' && len) {
-    ptr++;
-    len--;
+  for (; 
+       *ptr && *ptr == ' ' && len; 
+       ptr++, len--);
+
+#define OPWORDTEST(word, outcome)  \
+  do { \
+    char *opword; \
+    int opwordlen; \
+    opword = word; \
+    opwordlen = strlen(opword); \
+    if (op == 0 && len > opwordlen && strncmp(opword,ptr,opwordlen) == 0) { \
+      op = outcome; \
+      ptr += opwordlen; \
+      len -= opwordlen; \
+    } \
+  } while(0)
+
+  OPWORDTEST("merge", 1);
+  OPWORDTEST("unmerge", 2);
+  OPWORDTEST("add_button", 3);
+  OPWORDTEST("del_button", 4);
+  OPWORDTEST("add_axis", 5);
+  OPWORDTEST("del_axis", 6);
+
+  if (len == 0 || op == 0) error = 1;
+
+  if (!error) {
+    for (rptr = ptr; 
+         *rptr && (isspace(*rptr) || isdigit(*rptr)) && len; 
+         rptr++, len--);
+  
+    error = rptr != (buf+in_len);
   }
 
-#define opwordtest(word, outcome)  \
-  opword = word; \
-  opwordlen = strlen(opword); \
-  if (op == 0 && len > opwordlen && strncmp(opword,ptr,opwordlen) == 0) { \
-    op = outcome; \
-    ptr += opwordlen; \
-  }
-
-  opwordtest("merge", 1);
-  opwordtest("unmerge", 2);
-  opwordtest("add_button", 3);
-  opwordtest("del_button", 4);
-  opwordtest("add_axis", 5);
-  opwordtest("del_axis", 6);
-
-  if (len == 0 || op == 0) {
+  if (error) {
     kfree(buf);
     return in_len;
   }
@@ -394,7 +405,7 @@ static ssize_t unijoy_sysfs_store(struct kobject *kobj, struct attribute *attr,
 static struct unijoy_inph_source *unijoy_sysfs_find(__u64 id) {
   struct unijoy_inph_source *source, *result = 0;
   
-  if (id == (__u64)-1)
+  if (id == ULLONG_MAX)
     return 0;
 
   spin_lock(&unijoy_sysfs.sources_lock);
@@ -423,7 +434,7 @@ static struct unijoy_inph_source *unijoy_sysfs_find(__u64 id) {
       return; \
     if (dst_no < 0) { \
       for (i = 0; i < output. name ## _total ; i++) { \
-        if (output.source_ ## name ## _map[i].id == (__u64)-1) { \
+        if (output.source_ ## name ## _map[i].id == ULLONG_MAX) { \
           dst_no = i; \
           break; \
         } \
@@ -451,13 +462,13 @@ UNIJOY_ADD_RESOURCE(axis, axis, ABS_CNT);
     int i; \
     if (dst_no < 0 || dst_no >= output. name ## _total) \
       return; \
-    if (output.source_ ## name ##_map[dst_no].id == (__u64)-1) \
+    if (output.source_ ## name ##_map[dst_no].id == ULLONG_MAX) \
       return; \
     output.source_ ## name ## _map[dst_no].source = 0; \
-    output.source_ ## name ## _map[dst_no].id     = (__u64)-1; \
+    output.source_ ## name ## _map[dst_no].id     = ULLONG_MAX; \
     if (dst_no+1 == output. name ## _total) { \
       i = dst_no; \
-      while (output.source_ ## name ## _map[i].id == (__u64)-1) \
+      while (output.source_ ## name ## _map[i].id == ULLONG_MAX) \
         i--; \
       output. name ## _total = i+1; \
     } \
@@ -487,29 +498,29 @@ static void unijoy_sysfs_clean(struct unijoy_inph_source *source,
   if (!source)
     return;
 
-
-#define clean_resourse(name) \
-  for (i = 0; i < output. name ## _total; i++) { \
-    if (output.source_ ## name ## _map[i].id == source->id) { \
-      output.source_ ## name ## _map[i].source = 0; \
-      if (forever) \
-        output.source_ ## name ## _map[i].id = (__u64)-1; \
+#define CLEAN_RESOURCE(name) \
+  do { \
+    for (i = 0; i < output. name ## _total; i++) { \
+      if (output.source_ ## name ## _map[i].id == source->id) { \
+        output.source_ ## name ## _map[i].source = 0; \
+        if (forever) \
+          output.source_ ## name ## _map[i].id = ULLONG_MAX; \
+      } \
     } \
-  } \
-  i--; \
-  while (output.source_ ## name ## _map[i].id == (__u64)-1) \
     i--; \
-  output. name ## _total = i+1;
-
-  clean_resourse(buttons);
-  clean_resourse(axis);
+    while (output.source_ ## name ## _map[i].id == ULLONG_MAX) \
+      i--; \
+   output. name ## _total = i+1; \
+  } while (0) 
+  CLEAN_RESOURCE(buttons);
+  CLEAN_RESOURCE(axis);
 }
 
 static void unijoy_sysfs_unmerge(struct unijoy_inph_source *source) {
   if (!source)
     return;
 
-  if (source->state == UNIJOY_SOURCE_WASMERGED) {
+  if (source->state == UNIJOY_SOURCE_DISCONNECTED) {
     unijoy_sysfs_remove(source);
     return;
   }
@@ -543,7 +554,7 @@ static void unijoy_sysfs_suspend(struct unijoy_inph_source *source) {
 
   unijoy_sysfs_clean(source, false);
   unijoy_inph_refresh();
-  source->state = UNIJOY_SOURCE_WASMERGED;
+  source->state = UNIJOY_SOURCE_DISCONNECTED;
 }
 
 /* Input handlers implementation */
@@ -575,7 +586,7 @@ static int unijoy_inph_correct(int value, struct js_corr *corr) {
 			return 0;
 	}
 
-	return value < -32767 ? -32767 : (value > 32767 ? 32767 : value);
+	return value < SHRT_MIN ? SHRT_MIN : (value > SHRT_MAX ? SHRT_MAX : value);
 }
 
 static struct unijoy_inph_source *unijoy_inph_create(struct input_dev *dev,
@@ -692,7 +703,7 @@ static int unijoy_inph_connect(struct input_handler *handler,
   if (error)
     return error;
 
-  if (source->state == UNIJOY_SOURCE_WASMERGED) {
+  if (source->state == UNIJOY_SOURCE_DISCONNECTED) {
     unijoy_inph_relink(source, id);
     unijoy_sysfs_merge(source);
   }
@@ -715,9 +726,22 @@ static void unijoy_inph_disconnect(struct input_handle *handle) {
   input_unregister_handle(handle);
 }
 
-static int unijoy_thread_wakeup_condition() {
+static int unijoy_thread_wakeup_condition(void) {
   return (output.head != output.tail || output.full)
       || kthread_should_stop();
+}
+
+static __u64 unijoy_thread_nextdata(void) {
+  __u64 data = ULLONG_MAX;
+
+  spin_lock_irq(&output.buffer_lock);
+  data = output.buffer[output.tail++];
+  output.tail &= UNIJOY_BUFFER_SIZE - 1;
+  if (output.full)
+    output.full = false;
+  spin_unlock_irq(&output.buffer_lock);
+
+  return data;
 }
 
 static int unijoy_thread(void *nulldata) {
@@ -735,17 +759,10 @@ static int unijoy_thread(void *nulldata) {
     while (output.head != output.tail || output.full) {
       if (kthread_should_stop()) 
         return 0;
-      
-      data = (__u64)-1;
+        
+      data = unijoy_thread_nextdata();
 
-      spin_lock_irq(&output.buffer_lock);
-      data = output.buffer[output.tail++];
-      output.tail &= UNIJOY_BUFFER_SIZE - 1;
-      if (output.full)
-        output.full = false;
-      spin_unlock_irq(&output.buffer_lock);
-
-      if (data == (__u64)-1) 
+      if (data == ULLONG_MAX) 
         continue;
 
       action = (int)(data & 0xFFFF);
@@ -787,8 +804,8 @@ static void unijoy_inph_enqueue(__u64 data) {
   if (output.head == output.tail )
     output.full = true;
 
-unlock_exit:
   spin_unlock_irqrestore(&output.buffer_lock, flags);
+unlock_exit:
   wake_up_interruptible(&output.wait);
 }
 
@@ -907,10 +924,10 @@ int __init unijoy_init(void) {
     goto err_free_sysfs; 
 
   for (i = 0; i < ABS_CNT; i++) {
-    output.source_axis_map[i].id = (__u64)-1;
+    output.source_axis_map[i].id = ULLONG_MAX;
   }
   for (i = 0; i < UNIJOY_MAX_BUTTONS; i++) {
-    output.source_buttons_map[i].id = (__u64)-1;
+    output.source_buttons_map[i].id = ULLONG_MAX;
   }
 
   unijoy_inph_register();
@@ -937,3 +954,9 @@ void __exit unijoy_exit(void) {
 
 module_init(unijoy_init);
 module_exit(unijoy_exit);
+
+MODULE_LICENSE("Dual BSD/GPL");
+MODULE_AUTHOR("Alexander <iamtaingiteasy> Tumin");
+MODULE_DESCRIPTION("Makes a union of N other input/js devices");
+MODULE_SUPPORTED_DEVICE("input/jsN");
+
