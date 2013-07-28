@@ -1,16 +1,10 @@
 #include <linux/kernel.h>
+#include <linux/kthread.h>
 #include <linux/module.h>
-#include <linux/uaccess.h>
-#include <linux/major.h>
-#include <linux/cdev.h>
-#include <linux/signal.h>
 #include <linux/input.h>
 #include <linux/joystick.h>
 #include <linux/list.h>
-#include <linux/buffer_head.h>
 #include <linux/slab.h>
-#include <linux/mutex.h>
-#include <linux/sched.h>
 
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_AUTHOR("Alexander <iamtaingiteasy> Tumin");
@@ -74,40 +68,9 @@ MODULE_SUPPORTED_DEVICE("input/jsN");
 #define UNIJOY_BUFFER_SIZE 64
 #define UNIJOY_MAX_BUTTONS (KEY_MAX - BTN_MISC + 1)
 
-struct unijoy_fops_client {
-  struct js_event buffer[UNIJOY_MAX_BUTTONS];
-  int head;
-  int tail;
-  int startup;
-  spinlock_t buffer_lock;
-  struct fasync_struct *fasync;
-  struct list_head list;
-};
+/* Thread function */
 
-/* File operations */
-
-static int unijoy_fops_open(struct inode *, struct file *);
-static int unijoy_fops_release(struct inode *, struct file *);
-static ssize_t unijoy_fops_read(struct file *, char __user *, 
-                                size_t, loff_t *);
-static long unijoy_fops_ioctl(struct file *, unsigned int, unsigned long);
-static long unijoy_fops_ioctl_common(unsigned int, void __user *);
-static int unijoy_fops_fasync(int, struct file *, int);
-static void unijoy_fops_attach(struct unijoy_fops_client *);
-static void unijoy_fops_detach(struct unijoy_fops_client *);
-static inline int unijoy_fops_pending(struct unijoy_fops_client *);
-static int unijoy_fops_startup(struct unijoy_fops_client *, struct js_event *);
-static int unijoy_fops_next(struct unijoy_fops_client *, struct js_event *);
-
-static struct file_operations unijoy_fops = {
-  .owner          = THIS_MODULE,
-  .open           = unijoy_fops_open,
-  .release        = unijoy_fops_release,
-  .read           = unijoy_fops_read,
-  .unlocked_ioctl = unijoy_fops_ioctl,
-  .fasync         = unijoy_fops_fasync,
-  .llseek         = no_llseek
-};
+static int unijoy_thread(void *);
 
 /* Input handlers */
 
@@ -118,9 +81,14 @@ enum unijoy_inph_source_state {
 };
 
 static char *unijoy_inph_source_state_name[] = {
-  "ONLINE",
-  "MERGED",
+  "   ONLINE",
+  "   MERGED",
   "WASMERGED"
+};
+
+static char *unijoy_inph_source_link_state_name[] = {
+  " ONLINE",
+  "OFFLINE"
 };
 
 struct unijoy_inph_source {
@@ -142,24 +110,24 @@ struct unijoy_inph_source {
 struct unijoy_inph_source_map {
   struct unijoy_inph_source *source;
   int mapping;
+  long id;
 };
 
 static struct {
   int axis_no;
   int buttons_no;
-  __u8 axis_revmap[ABS_CNT];
-  __u16 button_revmap[UNIJOY_MAX_BUTTONS];
   struct unijoy_inph_source_map axis_map[ABS_CNT];
   struct unijoy_inph_source_map button_map[UNIJOY_MAX_BUTTONS];
-  struct list_head client_list;
-  spinlock_t client_lock;
+  struct input_dev *idev;
   wait_queue_head_t wait;
-  struct mutex mutex;
-  struct cdev cdev;
-  struct device dev;
-  int minor;
-  struct JS_DATA_SAVE_TYPE glue;
+  struct task_struct *kthread;
+  spinlock_t buffer_lock;
+  long buffer[UNIJOY_BUFFER_SIZE];
+  int head;
+  int tail;
+  bool full;
 } output;
+
 
 static void unijoy_inph_event(struct input_handle *, unsigned int, 
                               unsigned int, int);
@@ -169,7 +137,10 @@ static int unijoy_inph_connect(struct input_handler *, struct input_dev *,
 static void unijoy_inph_disconnect(struct input_handle *);
 static struct unijoy_inph_source *unijoy_inph_create(struct input_dev *);
 static int unijoy_inph_correct(int, struct js_corr *);
-static void unijoy_inph_distribute(struct js_event *);
+static void unijoy_inph_refresh(void);
+static void unijoy_inph_relink(struct unijoy_inph_source *, long);
+static void unijoy_inph_enqueue(unsigned long);
+
 
 static const struct input_device_id unijoy_inph_ids[] = {
 	{
@@ -240,6 +211,7 @@ static void unijoy_sysfs_add_button(struct unijoy_inph_source *, int, int);
 static void unijoy_sysfs_del_button(int);
 static void unijoy_sysfs_add_axis(struct unijoy_inph_source *, int, int);
 static void unijoy_sysfs_del_axis(int);
+static void unijoy_sysfs_clean(struct unijoy_inph_source *, bool);
 
 struct unijoy_sysfs_attr_type {
   struct attribute attr;
@@ -281,8 +253,6 @@ static inline long unijoy_make_id(struct input_id id) {
        + ((long)id.version      );
 }
 
-/* Sysfs */
-
 static int unijoy_sysfs_setup(void) {
   unijoy_sysfs_kobject = kzalloc(sizeof(struct kobject), GFP_KERNEL);
   
@@ -308,8 +278,6 @@ static void unijoy_sysfs_free(void) {
   list_for_each_safe(pos, q, &unijoy_sysfs.sources.list) {
     source = list_entry(pos, struct unijoy_inph_source, list);
 
-//    unijoy_sysfs_unmerge(source);
-
     list_del(pos);
     kfree(source);
   }
@@ -334,23 +302,29 @@ static ssize_t unijoy_sysfs_show(struct kobject *kobj, struct attribute *attr,
   }
   offset += scnprintf(buf+offset, PAGE_SIZE-offset,
                       "Operating as /dev/input/js%d\nCurrent mappings:\n",
-                      output.minor);
+                      99);
   
   for (i = 0; i < output.buttons_no; i++) {
     if (!output.button_map[i].source) 
       continue;
     offset += scnprintf(buf+offset, PAGE_SIZE-offset,
-                      "BTN #%3d -> %3d of %ld\n",
+                      "BTN #%3d -> %3d of %ld %s\n",
                       i, output.button_map[i].mapping,
-                      output.button_map[i].source->id);
+                      output.button_map[i].id,
+                      unijoy_inph_source_link_state_name[
+                        (output.button_map[i].source ? 0 : 1)
+                      ]);
   }
   for (i = 0; i < output.axis_no; i++) {
     if (!output.axis_map[i].source) 
       continue;
     offset += scnprintf(buf+offset, PAGE_SIZE-offset,
-                      "AXS #%3d -> %3d of %ld\n",
+                      "AXS #%3d -> %3d of %ld %s\n",
                       i, output.axis_map[i].mapping,
-                      output.axis_map[i].source->id);
+                      output.axis_map[i].id,
+                      unijoy_inph_source_link_state_name[
+                        (output.axis_map[i].source ? 0 : 1)
+                      ]);
   }
   spin_unlock(&unijoy_sysfs.sources_lock);
   return offset;
@@ -364,7 +338,7 @@ static ssize_t unijoy_sysfs_store(struct kobject *kobj, struct attribute *attr,
   int len = in_len;
   char *opword;
   int opwordlen;
-  long id = 0;
+  long id = -1;
   int arg1 = -1, arg2 = -1;
 
   memmove(buf, in_buf, in_len);
@@ -429,6 +403,7 @@ static ssize_t unijoy_sysfs_store(struct kobject *kobj, struct attribute *attr,
   return in_len;
 }
 
+
 static struct unijoy_inph_source *unijoy_sysfs_find(long id) {
   struct unijoy_inph_source *source, *result = 0;
   
@@ -479,6 +454,9 @@ static void unijoy_sysfs_add_button(struct unijoy_inph_source *source,
 
   output.button_map[dst_no].source  = source;
   output.button_map[dst_no].mapping = src_no;
+  output.button_map[dst_no].id      = source->id;
+
+  unijoy_inph_refresh();
 }
 
 static void unijoy_sysfs_del_button(int dst_no) {
@@ -491,6 +469,7 @@ static void unijoy_sysfs_del_button(int dst_no) {
     return;
 
   output.button_map[dst_no].source = 0;
+  output.button_map[dst_no].id     = 0;
 
   if (dst_no+1 == output.buttons_no) {
     i = dst_no;
@@ -500,6 +479,7 @@ static void unijoy_sysfs_del_button(int dst_no) {
 
     output.buttons_no = i+1;
   }
+  unijoy_inph_refresh();
 }
 
 /* TODO: generalize with add_button */
@@ -536,6 +516,8 @@ static void unijoy_sysfs_add_axis(struct unijoy_inph_source *source,
 
   output.axis_map[dst_no].source  = source;
   output.axis_map[dst_no].mapping = src_no;
+  output.axis_map[dst_no].id      = source->id;
+  unijoy_inph_refresh();
 }
 
 /* TODO: generalize with del_button */
@@ -549,6 +531,7 @@ static void unijoy_sysfs_del_axis(int dst_no) {
     return;
 
   output.axis_map[dst_no].source = 0;
+  output.axis_map[dst_no].id     = 0;
 
   if (dst_no+1 == output.axis_no) {
     i = dst_no;
@@ -558,6 +541,7 @@ static void unijoy_sysfs_del_axis(int dst_no) {
 
     output.axis_no = i+1;
   }
+  unijoy_inph_refresh();
 }
 
 static void unijoy_sysfs_merge(struct unijoy_inph_source *source) {
@@ -571,6 +555,41 @@ static void unijoy_sysfs_merge(struct unijoy_inph_source *source) {
   input_open_device(&source->handle);
 
   source->state = UNIJOY_SOURCE_MERGED;
+  unijoy_inph_refresh();
+}
+
+static void unijoy_sysfs_clean(struct unijoy_inph_source *source,
+                               bool force) {
+  int i;
+
+  if (!source)
+    return;
+
+  for (i = 0; i < output.axis_no; i++) {
+    if (output.axis_map[i].source == source) {
+      output.axis_map[i].source = 0;
+      if (force) {
+        output.axis_map[i].id = 0;
+      }
+    }
+  }
+  i--;
+  while (!output.axis_map[i].id)
+    i--;
+  output.axis_no = i+1;
+
+  for (i = 0; i < output.buttons_no; i++) {
+    if (output.button_map[i].source == source) {
+      output.button_map[i].source = 0;
+      if (force) {
+        output.button_map[i].id = 0;
+      }
+    }
+  }
+  i--;
+  while (!output.button_map[i].id)
+    i--;
+  output.buttons_no = i+1;
 }
 
 static void unijoy_sysfs_unmerge(struct unijoy_inph_source *source) {
@@ -586,8 +605,11 @@ static void unijoy_sysfs_unmerge(struct unijoy_inph_source *source) {
     return;
 
   input_close_device(&source->handle);
-
+  
   source->state = UNIJOY_SOURCE_ONLINE;
+  
+  unijoy_sysfs_clean(source, true);
+  unijoy_inph_refresh();
 }
 
 static void unijoy_sysfs_remove(struct unijoy_inph_source *source) {
@@ -604,7 +626,7 @@ static void unijoy_sysfs_suspend(struct unijoy_inph_source *source) {
     return;
 
   input_close_device(&source->handle);
-
+  
   source->state = UNIJOY_SOURCE_WASMERGED;
 }
 
@@ -714,23 +736,18 @@ static struct unijoy_inph_source *unijoy_inph_create(struct input_dev *dev) {
   return source;
 }
 
-static void unijoy_inph_distribute(struct js_event *event) {
-  struct unijoy_fops_client *client;
-  rcu_read_lock();
-  list_for_each_entry_rcu(client, &output.client_list, list) {
-    spin_lock(&client->buffer_lock);
-    client->buffer[client->head] = *event;
-    if (client->startup == output.axis_no + output.buttons_no) {
-      client->head++;
-      client->head &= UNIJOY_BUFFER_SIZE - 1;
-      if (client->tail == client->head) {
-        client->startup = 0;
-      }
+static void unijoy_inph_relink(struct unijoy_inph_source *source, long id) {
+  int i;
+  for (i = 0; i < output.buttons_no; i++) {
+    if (output.button_map[i].id == id) {
+      output.button_map[i].source = source;
     }
-    spin_unlock(&client->buffer_lock);
-    kill_fasync(&client->fasync, SIGIO, POLL_IN);
   }
-  rcu_read_unlock();
+  for (i = 0; i < output.axis_no; i++) {
+    if (output.axis_map[i].id == id) {
+      output.axis_map[i].source = source;
+    }
+  }
 }
 
 static int unijoy_inph_connect(struct input_handler *handler, 
@@ -739,8 +756,13 @@ static int unijoy_inph_connect(struct input_handler *handler,
   struct unijoy_inph_source *source;
   int error;
   long id;
-
+  
   id = unijoy_make_id(dev->id);
+
+  if (id == 0) {
+    return 0;
+  }
+
   source = unijoy_sysfs_find(id);
 
   if (!source) {
@@ -760,7 +782,7 @@ static int unijoy_inph_connect(struct input_handler *handler,
     return error;
 
   if (source->state == UNIJOY_SOURCE_WASMERGED) {
-    unijoy_sysfs_merge(source);
+    unijoy_inph_relink(source,id);
   }
 
   return 0;
@@ -769,6 +791,9 @@ static int unijoy_inph_connect(struct input_handler *handler,
 static void unijoy_inph_disconnect(struct input_handle *handle) {
   struct unijoy_inph_source *source = handle->private;
 
+  if (!source) 
+    return;
+
   if (source->state == UNIJOY_SOURCE_MERGED) {
     unijoy_sysfs_suspend(source);
   } else {
@@ -776,6 +801,66 @@ static void unijoy_inph_disconnect(struct input_handle *handle) {
   }
 
   input_unregister_handle(handle);
+
+  unijoy_sysfs_clean(source, false);
+}
+
+static int unijoy_thread(void *nulldata) {
+  unsigned long data = 0;
+  int value;
+  int number;
+  int type;
+
+  while (1) {
+    wait_event_interruptible(output.wait, 
+        ((output.head != output.tail) || kthread_should_stop()));
+    if (kthread_should_stop()) 
+      return 0;
+    while (output.head != output.tail) {
+      if (kthread_should_stop()) 
+        return 0;
+      spin_lock_irq(&output.buffer_lock);
+      if (output.head != output.tail && !output.full) {
+        data = output.buffer[output.tail++];
+        output.tail &= UNIJOY_BUFFER_SIZE - 1;
+        if (output.full) 
+          output.full = false;
+      }
+      spin_unlock_irq(&output.buffer_lock);
+      value = (int)(data & 0xFFFFFFFF); 
+      number = (int)((data>>32) & 0xFFFF);
+      type   = (int)((data>>48) & 0xFFFF);
+
+      switch (type) {
+        case 0:
+          input_report_key(output.idev, number, value);
+          break;
+        case 1:
+          input_report_abs(output.idev, number, value);
+          break;
+      }
+      input_sync(output.idev);
+    }
+  }
+  return 0;
+}
+
+static void unijoy_inph_enqueue(unsigned long data) {
+  spin_lock(&output.buffer_lock);
+  if (output.full)
+    goto unlock_exit;
+
+  output.buffer[output.head] = data;
+
+  output.head++;
+  output.head &= UNIJOY_BUFFER_SIZE - 1;
+
+  if (output.head == output.tail)
+    output.full = true;
+
+unlock_exit:
+  spin_unlock(&output.buffer_lock);
+  wake_up_interruptible(&output.wait);
 }
 
 static void unijoy_inph_event(struct input_handle *handle,
@@ -783,370 +868,132 @@ static void unijoy_inph_event(struct input_handle *handle,
                               unsigned int code,
                               int value) {
   struct unijoy_inph_source *source = handle->private;
-  struct js_event source_event;
-  struct js_event passing_event;
+  unsigned int number;
+  unsigned long data;
   int i;
 
+  if (!source)
+    return;
+  
   switch (type) {
     case EV_KEY:
-      if (code < BTN_MISC || value == 2) 
+      if (code < BTN_MISC || value == 2) {
         return;
-
-      source_event.type = JS_EVENT_BUTTON;
-      source_event.number = source->button_map[code - BTN_MISC];
-      source_event.value = value;
+      }
+      number = source->button_map[code - BTN_MISC];
+      for (i = 0; i < output.buttons_no; i++) {
+        if (output.button_map[i].source == source &&
+            output.button_map[i].mapping == number) {
+          data = ((long)0<<48) 
+               + ((long)(i+BTN_JOYSTICK)<<32)
+               + ((unsigned int)value);
+          unijoy_inph_enqueue(data);
+        }
+      }
       break;
     case EV_ABS:
-      source_event.type = JS_EVENT_AXIS;
-      source_event.number = source->axis_map[code];
-      source_event.value = 
-        unijoy_inph_correct(value, &source->corrections[source_event.number]);
-      
-      if (source_event.value == source->axis[source_event.number]) 
-        return;
+      number = source->axis_map[code];
+      value = unijoy_inph_correct(value, &source->corrections[number]);
+      for (i = 0; i < output.axis_no; i++) {
+        if (output.axis_map[i].source == source &&
+            output.axis_map[i].mapping == number) {
+          data = ((long)1<<48) 
+               + ((long)i<<32)
+               + ((unsigned int)value);
+          unijoy_inph_enqueue(data);
+        }
+      }
 
-      source->axis[source_event.number] = source_event.value;
       break;
     default:
       return;
   }
-
-  source_event.time = jiffies_to_msecs(jiffies);
-  passing_event = source_event;
-
-  switch (source_event.type) {
-    case JS_EVENT_BUTTON:
-      for (i = 0; i < output.buttons_no; i++) {
-        if (output.button_map[i].source == source &&
-            output.button_map[i].mapping == source_event.number) {
-          passing_event.number = i;
-          unijoy_inph_distribute(&passing_event);
-        }
-      }
-      break;
-    case JS_EVENT_AXIS:
-      for (i = 0; i < output.axis_no; i++) {
-        if (output.axis_map[i].source == source &&
-            output.axis_map[i].mapping == source_event.number) {
-          passing_event.number = i;
-          unijoy_inph_distribute(&passing_event);
-        }
-      }
-      break;
-  }
-
-  wake_up_interruptible(&output.wait);
 }
 
-/* File I/O */
-static void unijoy_fops_attach(struct unijoy_fops_client *client) {
-	spin_lock(&output.client_lock);
-	list_add_tail_rcu(&client->list, &output.client_list);
-	spin_unlock(&output.client_lock);
-}
+static void unijoy_inph_refresh(void) {
+  int i;
+  struct input_dev *idev = 0;
 
-static void unijoy_fops_detach(struct unijoy_fops_client *client) {
-	spin_lock(&output.client_lock);
-	list_del_rcu(&client->list);
-	spin_unlock(&output.client_lock);
-	synchronize_rcu();
-}
-
-static int unijoy_fops_open(struct inode *inode, struct file *file) {
-  struct unijoy_fops_client *client;
-
-  client = kzalloc(sizeof(struct unijoy_fops_client), GFP_KERNEL);
-  if (!client)
-    return -ENOMEM;
-
-  spin_lock_init(&client->buffer_lock);
-  unijoy_fops_attach(client);
-
-  file->private_data = client;
-  nonseekable_open(inode, file);
-
-  return 0;
-}
-
-static int unijoy_fops_release(struct inode *inode, struct file *file) {
-	struct unijoy_fops_client *client = file->private_data;
-	unijoy_fops_detach(client);
-	kfree(client);
-	return 0;
-}
-
-static int unijoy_fops_fasync(int fd, struct file *file, int on) {
-	struct unijoy_fops_client *client = file->private_data;
-
-	return fasync_helper(fd, file, on, &client->fasync);
-}
-
-
-static long unijoy_fops_ioctl(struct file *file, 
-                              unsigned int cmd, unsigned long arg) {
-  void __user *argp = (void __user *)arg;
-  int retval;
-
-  retval = mutex_lock_interruptible(&output.mutex);
+  if (output.axis_no < 0 && output.buttons_no < 0)
+    return;
   
-  if (retval)
-    return retval;
-
-  switch (cmd) {
-    case JS_SET_TIMELIMIT:
-      retval = get_user(output.glue.JS_TIMELIMIT, (long __user *)arg);
-      break;
-    case JS_GET_TIMELIMIT:
-      retval = put_user(output.glue.JS_TIMELIMIT, (long __user *)arg);
-      break;
-    case JS_SET_ALL:
-      retval = copy_from_user(&output.glue, argp, sizeof(output.glue)) 
-        ? -EFAULT : 0;
-      break;
-    case JS_GET_ALL:
-      retval = copy_to_user(argp, &output.glue, sizeof(output.glue))
-        ? -EFAULT : 0;
-      break;
-    default:
-      retval = unijoy_fops_ioctl_common(cmd, argp);
-      break;
-  }
-
-  mutex_unlock(&output.mutex);
-  return retval;
-}
-
-static long unijoy_fops_ioctl_common(unsigned int cmd, void __user *argp) {
-  size_t len;
-  const char *name;
-
-  switch (cmd) {
-    case JS_SET_CAL:
-      return copy_from_user(&output.glue.JS_CORR, argp, 
-                            sizeof(output.glue.JS_CORR)) ? -EFAULT : 0;
-    case JS_GET_CAL:
-      return copy_to_user(argp, &output.glue.JS_CORR,
-                          sizeof(output.glue.JS_CORR)) ? -EFAULT : 0;
-
-    case JS_SET_TIMEOUT:
-      return get_user(output.glue.JS_TIMEOUT, (s32 __user *)argp);
-
-    case JS_GET_TIMEOUT:
-      return put_user(output.glue.JS_TIMEOUT, (s32 __user *)argp);
-
-    case JSIOCGVERSION:
-      return put_user(JS_VERSION, (__u32 __user *)argp);
-
-    case JSIOCGAXES:
-      return put_user(output.axis_no, (__u8 __user *)argp);
-
-    case JSIOCGBUTTONS:
-      return put_user(output.buttons_no, (__u8 __user *)argp);
-    
-    /* TODO: implement */
-    case JSIOCSCORR:
-    case JSIOCGCORR:
-      return -EINVAL;
-  }
-
-  switch (cmd & ~IOCSIZE_MASK) {
-    case (JSIOCGAXMAP & ~IOCSIZE_MASK):
-      len = min_t(size_t, _IOC_SIZE(cmd), sizeof(output.axis_revmap));
-      return copy_to_user(argp, output.axis_revmap, len) ? -EFAULT : len;
-
-    case (JSIOCGBTNMAP & ~IOCSIZE_MASK):
-      len = min_t(size_t, _IOC_SIZE(cmd), sizeof(output.button_revmap));
-      return copy_to_user(argp, output.button_revmap, len) ? -EFAULT : len;
-
-    /* TODO: implement */
-    case (JSIOCSAXMAP & ~IOCSIZE_MASK):
-    case (JSIOCSBTNMAP & ~IOCSIZE_MASK):
-      return -EINVAL;
-
-    case JSIOCGNAME(0):
-      name = "unijoy v0.2";
-      len = min_t(size_t, _IOC_SIZE(cmd), strlen(name) + 1);
-      return copy_to_user(argp, name, len) ? -EFAULT : len;
-  }
-
-  return -EINVAL;
-}
-
-static inline int unijoy_fops_pending(struct unijoy_fops_client *client) {
-  return client->startup < (output.axis_no + output.buttons_no) ||
-         client->head != client->tail;
-}
-
-static int unijoy_fops_startup(struct unijoy_fops_client *client,
-                               struct js_event *event) {
-  int have_event;
-  struct unijoy_inph_source_map map;
-  struct input_dev *input;
-  int button;
+  idev = input_allocate_device();
+  idev->name = "unijoy v0.3";
+  input_alloc_absinfo(idev);
 
 
-  spin_lock_irq(&client->buffer_lock);
-  have_event = client->startup < (output.axis_no + output.buttons_no);
-
-  if (have_event) {
-    
-    event->time = jiffies_to_msecs(jiffies);
-    if (client->startup < output.buttons_no) {
-      event->type = JS_EVENT_BUTTON | JS_EVENT_INIT;
-      event->number = client->startup;
-      map = output.button_map[event->number];
-      if (map.source) {
-        event->value = 0;
+  if (output.buttons_no > 0) {
+    set_bit(EV_KEY, idev->evbit);
+    for (i = 0; i < output.buttons_no; i++) {
+      if (i+BTN_JOYSTICK < KEY_MAX) {
+        set_bit(i+BTN_JOYSTICK, idev->keybit);
       } else {
-        button = map.source->button_revmap[map.mapping];
-        input = map.source->handle.dev;
-        event->value = !!test_bit(button, input->key);
-      }
-    } else {
-      event->type = JS_EVENT_AXIS | JS_EVENT_INIT;
-      event->number = client->startup - output.buttons_no;
-      map = output.axis_map[event->number];
-      if (!map.source) {
-        event->value = 0;
-      } else {
-        event->value = map.source->axis[map.mapping];
+        set_bit((i+BTN_JOYSTICK) - KEY_MAX + BTN_MISC, idev->keybit);
       }
     }
-
-    client->startup++;
   }
 
-  spin_unlock_irq(&client->buffer_lock);
-  return have_event;
-}
-
-static int unijoy_fops_next(struct unijoy_fops_client *client,
-                            struct js_event *event) {
-  int have_event;
-
-  spin_lock_irq(&client->buffer_lock);
-
-  have_event = client->head != client->tail;
-  
-  if (have_event) {
-    *event = client->buffer[client->tail++];
-    client->tail &= UNIJOY_BUFFER_SIZE - 1;
-  }
-
-  spin_unlock_irq(&client->buffer_lock);
-
-  return have_event;
-}
-
-static ssize_t unijoy_fops_read(struct file *file, char __user *buf, 
-                                size_t count, loff_t *ppos) {
-
-  struct unijoy_fops_client *client = file->private_data;
-  struct js_event event;
-  int retval;
-
-  if (count < sizeof(struct js_event))
-    return -EINVAL;
-
-  if (count == sizeof(struct JS_DATA_TYPE)) {
-    // TODO: implement old interface
-    return -EINVAL;
-  }
-
-  if (!unijoy_fops_pending(client) && (file->f_flags & O_NONBLOCK))
-    return -EAGAIN;
-
-  retval = wait_event_interruptible(output.wait, unijoy_fops_pending(client));
-  if (retval)
-    return retval;
-
-  while (retval + sizeof(struct js_event) <= count &&
-         unijoy_fops_startup(client, &event)) {
-    if (copy_to_user(buf+retval, &event, sizeof(struct js_event))) {
-      return -EFAULT;
+  if (output.axis_no > 0) {
+    set_bit(EV_ABS, idev->evbit);
+    for (i = 0; i < output.axis_no; i++) {
+      set_bit(i, idev->absbit);
     }
-    retval += sizeof(struct js_event);
   }
 
-  while (retval + sizeof(struct js_event) <= count &&
-         unijoy_fops_next(client, &event)) {
-    if (copy_to_user(buf+retval, &event, sizeof(struct js_event))) {
-      return -EFAULT;
-    }
-    retval += sizeof(struct js_event);
+  if (output.idev) {
+    input_unregister_device(output.idev);
+    input_free_device(output.idev);
+    output.idev = 0;
   }
-  
-  return retval;
+
+  if (input_register_device(idev)) {
+    input_free_device(idev);
+  } else {
+    output.idev = idev;
+  }
+
 }
 
 /* Main entry points */
 
 int __init unijoy_init(void) {
-  int i;
   int error;
-  
-  output.minor = input_get_new_minor(UNIJOY_MINOR_BASE, UNIJOY_MINORS, true);
-  
-  if (output.minor < 0)
-    return -EINVAL;
-  
-  output.dev.devt = MKDEV(INPUT_MAJOR, output.minor);
-  output.dev.class = &input_class;
-  device_initialize(&output.dev);
-  
-  if (device_create(&input_class, 0, output.dev.devt, 0, "js%d", output.minor) == 0) {
-    error = -EINVAL;
-    goto err_input_free_minor;
-  }
-
-  cdev_init(&output.cdev, &unijoy_fops);
-  output.cdev.kobj.parent = &output.dev.kobj;
-  error = cdev_add(&output.cdev, output.dev.devt, 1);
-  
-  if (error)
-    goto err_cdev_destroy;
 
   error = unijoy_sysfs_setup();
 
   if (error)
-    goto err_cdev_del;
-
-  INIT_LIST_HEAD(&output.client_list);
-  spin_lock_init(&output.client_lock);
-  mutex_init(&output.mutex);
-  init_waitqueue_head(&output.wait);
-
-  for (i = 0; i < ABS_CNT; i++)
-    output.axis_revmap[i] = i;
-
-  for (i = 0; i < UNIJOY_MAX_BUTTONS; i++)
-    output.button_revmap[i] = BTN_MISC + i;
+    return error;
 
   error = input_register_handler(&unijoy_inph);
 
   if (error)
-    goto err_free_sysfs;   
+    goto err_free_sysfs; 
+
+  spin_lock_init(&output.buffer_lock);
+  init_waitqueue_head(&output.wait);
+  output.kthread = kthread_create(unijoy_thread,0,"unijoy_thread");
+
+  wake_up_process(output.kthread);  
 
   return 0;
-
+  
 err_free_sysfs:
   unijoy_sysfs_free();
-err_cdev_del:
-  cdev_del(&output.cdev);
-err_cdev_destroy:
-  device_destroy(&input_class, output.dev.devt);
-err_input_free_minor:
-  input_free_minor(output.minor);
-
+  
   return error;
 }
 
 void __exit unijoy_exit(void) {
+  kthread_stop(output.kthread);
+  
+  if (output.idev) {
+    input_unregister_device(output.idev);
+    input_free_device(output.idev);
+    output.idev = 0;
+  }
+
   input_unregister_handler(&unijoy_inph);
   unijoy_sysfs_free();
-  cdev_del(&output.cdev);
-  device_destroy(&input_class, output.dev.devt);
-  input_free_minor(output.minor);
 }
 
 module_init(unijoy_init);
