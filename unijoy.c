@@ -677,9 +677,9 @@ static int unijoy_inph_connect(struct input_handler *handler,
   __u64 id;
 
   id = ((long)dev->id.bustype << 48)
-     + ((long)dev->id.vendor  << 32)
-     + ((long)dev->id.product << 16)
-     + ((long)dev->id.version      );
+     | ((long)dev->id.vendor  << 32)
+     | ((long)dev->id.product << 16)
+     | ((long)dev->id.version      );
 
   if (id == 0)
     return 0;
@@ -836,8 +836,8 @@ static void unijoy_inph_event(struct input_handle *handle,
             subcode = i+BTN_MISC;
           }
           data = ((__u64)((__u32)value)<<32)
-               + ((__u16)subcode<<16)
-               + ((__u16)UNIJOY_ACTION_EMMIT_BUTTON);
+               | ((__u16)subcode<<16)
+               | ((__u16)UNIJOY_ACTION_EMMIT_BUTTON);
           unijoy_inph_enqueue(data);
         }
       }
@@ -849,8 +849,8 @@ static void unijoy_inph_event(struct input_handle *handle,
         if (output.source_axis_map[i].source == source &&
             output.source_axis_map[i].value == number) {
           data = ((__u64)((__u32)value)<<32)
-               + ((__u16)i<<16)
-               + ((__u16)UNIJOY_ACTION_EMMIT_AXIS);
+               | ((__u16)i<<16)
+               | ((__u16)UNIJOY_ACTION_EMMIT_AXIS);
           unijoy_inph_enqueue(data);
         }
       }
