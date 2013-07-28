@@ -290,18 +290,22 @@ static ssize_t unijoy_sysfs_show(struct kobject *kobj, struct attribute *attr,
                       "Current mappings:\n");
   
   for (i = 0; i < output.buttons_total; i++) {
+    if (output.source_buttons_map[i].id == ULLONG_MAX)
+      continue;
     offset += scnprintf(buf+offset, PAGE_SIZE-offset,
                       "BTN #%3d -> %3d of %llu %s\n",
-                      i, output.source_buttons_map[i].value,
+                      output.source_buttons_map[i].value, i,
                       output.source_buttons_map[i].id,
                       unijoy_inph_mapping_names[
                         (output.source_buttons_map[i].source ? 0 : 1)
                       ]);
   }
   for (i = 0; i < output.axis_total; i++) {
+    if (output.source_buttons_map[i].id == ULLONG_MAX)
+      continue;
     offset += scnprintf(buf+offset, PAGE_SIZE-offset,
                       "AXS #%3d -> %3d of %llu %s\n",
-                      i, output.source_axis_map[i].value,
+                      output.source_axis_map[i].value, i,
                       output.source_axis_map[i].id,
                       unijoy_inph_mapping_names[
                         (output.source_axis_map[i].source ? 0 : 1)
