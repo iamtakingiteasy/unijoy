@@ -280,7 +280,7 @@ static ssize_t unijoy_sysfs_show(struct kobject *kobj, struct attribute *attr,
   spin_lock(&unijoy_sysfs.sources_lock);
   list_for_each_entry(source, &unijoy_sysfs.sources.list, list) {
     offset += scnprintf(buf+offset, PAGE_SIZE-offset,
-                        "%llu\t%s\t%3d\t%3d\t%s\n",
+                        "%15llu %s %3d %3d %s\n",
                         source->id,
                         unijoy_inph_state_names[source->state],
                         source->axis_total, source->buttons_total,
@@ -301,7 +301,7 @@ static ssize_t unijoy_sysfs_show(struct kobject *kobj, struct attribute *attr,
                       ]);
   }
   for (i = 0; i < output.axis_total; i++) {
-    if (output.source_buttons_map[i].id == ULLONG_MAX)
+    if (output.source_axis_map[i].id == ULLONG_MAX)
       continue;
     offset += scnprintf(buf+offset, PAGE_SIZE-offset,
                       "AXS #%3d -> %3d of %llu %s\n",

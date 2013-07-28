@@ -27,9 +27,12 @@ echo add_button 849162346299665 10  8 > $device_file
 echo add_button 849162346299665 11  9 > $device_file
 echo add_button 849162346299665 12 10 > $device_file
 echo add_button 849162346299665 13 11 > $device_file
+echo add_button 849162346299665  2 16 > $device_file
 
 # throttle
 echo add_axis 849162346430737  2  4 > $device_file
+echo add_axis 849162346430737  5  5 > $device_file
+echo add_axis 849162346430737  6  6 > $device_file
 
 echo add_button 849162346430737 8  12 > $device_file
 echo add_button 849162346430737 9  13 > $device_file
